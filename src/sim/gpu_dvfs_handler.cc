@@ -110,16 +110,16 @@ int GpuDVFSHandler::checkIfGPUIsRunning()
                 for (auto *wave : simd_waves) {
                     // If any wave is NOT stopped, the GPU is running
                     double ipc = cu->stats.ipc.total();
-                    if(!std::isnan(ipc) && ipc > 0){
-                    //if (wave->getStatus() != Wavefront::S_STOPPED) {
-                        detected = 1;
+                    //if(!std::isnan(ipc) && ipc > 0){
+                    if (wave->getStatus() != Wavefront::S_STOPPED) {
+                       return 1;
                     //}
                     }
                 }
             }
         }
     }
-    return detected;
+    return 0;
 }
 
 
@@ -151,12 +151,18 @@ int GpuDVFSHandler::dumpImportantStatsToConsole()
 {
     static double prevInstTotal[40] = {0};
     static double prevNumCycles[40] = {0};
+    static double initTime = 0;
+    static double edpTotal = 0.0;
+    static double ed2pTotal = 0.0;
     // Iterate over ALL Compute Units
     int index = 0;
     for (auto *cu : gpuShader->cuList) {
         // Iterate over ALL SIMDs
         double ipc = cu->stats.ipc.total();
         if(!std::isnan(ipc) && ipc > 0){
+            if(initTime == 0){
+                initTime = curTick();
+            }
             double instr = cu->stats.numInstrExecuted.total();
             double deltaInstr = instr - prevInstTotal[index];
             double numCycles = cu->stats.totalCycles.total();
@@ -164,11 +170,14 @@ int GpuDVFSHandler::dumpImportantStatsToConsole()
             if(deltaInstr < 0) deltaInstr = instr;
             if(deltaNumCycles < 0) deltaNumCycles = numCycles;
             double deltaIPC = deltaInstr / deltaNumCycles;
-
-            inform("GPU_DVFS_STATS: CU: %d, perfLevel: %d clock: %d, Cycles: %d, IPC: %f, IPC_delta: %f, CPI: %f, CPI_delta: %f, Frequency: %d, Voltage: %f, EDP: %f, ED2P: %f, Sensitivity: %f"
+            double edp = cu->voltage() * cu->voltage() * cu->frequency() * deltaInstr;
+            double ed2p = edp * deltaInstr;
+            edpTotal += edp; 
+            ed2pTotal += ed2p; 
+            inform("GPU_DVFS_STATS: CU: %d, perfLevel: %d clock: %d, Cycles: %d, IPC: %f, IPC_delta: %f, CPI: %f, CPI_delta: %f, Frequency: %d, Voltage: %f, EDP: %f, ED2P: %f, EDP_Total: %f, ED2P_Total: %f, Sensitivity: %f"
                , index
                , domains.begin()->second->perfLevel()
-               , curTick()
+               , curTick() - initTime
                , cu->stats.totalCycles.total()
                , cu->stats.ipc.total()
                , deltaIPC
@@ -176,8 +185,10 @@ int GpuDVFSHandler::dumpImportantStatsToConsole()
                , (deltaIPC > 0) ? (1.0 / deltaIPC) : 0
                , cu->frequency()
                , cu->voltage()
-               , cu->voltage() * cu->frequency() * deltaIPC
-               , cu->voltage() * cu->frequency() * deltaIPC * deltaIPC
+               , edp
+               , ed2p
+               , edpTotal
+               , ed2pTotal
                , sensitivity[index]
             );
             prevInstTotal[index] = instr;
@@ -208,6 +219,7 @@ void GpuDVFSHandler::runDecisionLoop()
 {
     static bool hasPrintedRunning = false;
     static int idleHeartbeat = 0;
+    static double maxSensitivity = 0.0;
 
     int isRunning = checkIfGPUIsRunning();
 
@@ -238,6 +250,9 @@ void GpuDVFSHandler::runDecisionLoop()
     }
     computeUnitSensitivity();
     double average = sensitivityAverage();
+    if(average > maxSensitivity){
+        maxSensitivity = average;
+    }
     inform("GPU_DVFS: Average CU Sensitivity: %f", average);
     if(printToScreen)
         dumpImportantStatsToConsole();
@@ -297,15 +312,44 @@ void GpuDVFSHandler::runDecisionLoop()
     //else {
     //    desiredLevel = 0; // Max Perf
     //}
-    desiredLevel = 2;
-   /*if (average > threshold1) {
-        desiredLevel = 0; // Max Perf
-    } else if(average > threshold2){
-        desiredLevel = 1; // Med Perf
-    }else {
-        desiredLevel = 2; // Low Perf
-    }*/
+   // desiredLevel = 2;
 
+   static int count1 = 0;
+   static int count2 = 0;
+   static int count3 = 0;
+
+
+    if (average/maxSensitivity > .66) {
+        //desiredLevel = 0; // Max Perf
+        count1++;
+        count2 = count2 > 0 ? count2 - 1 : 0;
+        count3 = count3 > 0 ? count3 - 1 : 0;
+    } else if(average/maxSensitivity > .33){
+        count2++;
+        count1 = count1 > 0 ? count1 - 1 : 0;
+        count3 = count3 > 0 ? count3 - 1 : 0;
+        //desiredLevel = 1; // Med Perf
+    }else {
+        count1 = count1 > 0 ? count1 - 1 : 0;
+        count2 = count2 > 0 ? count2 - 1 : 0;
+        count3++;
+        //desiredLevel = 2; // Low Perf
+    }
+
+    if(count1 >=2){
+        desiredLevel = 0; // Max Perf
+    }else if(count2 >=2){
+        desiredLevel = 1; // Med Perf
+    }else if(count3 >=2){
+        desiredLevel = 2; // Low Perf
+    }
+    if(desiredLevel != currentLevel){
+        count1 = 0;
+        count2 = 0;
+        count3 = 0;
+    }
+
+    maxSensitivity *= 0.95; // Decay over time
 
     // 4. ACTUATION PHASE
     if (desiredLevel != currentLevel) {
