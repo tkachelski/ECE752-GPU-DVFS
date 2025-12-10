@@ -56,9 +56,13 @@ class GpuDVFSHandler : public SimObject
     // Pointer to the real GPU hardware
     Shader *gpuShader;
 
-    double threshold1;
-    double threshold2;
     bool printToScreen;
+    int dvfs_type;
+    double highThresh;
+    double medThresh;
+    int dvfs_sr;
+    double decay_factor;
+
 
     // Main event wrapper for the decision loop
     EventFunctionWrapper decisionEvent;

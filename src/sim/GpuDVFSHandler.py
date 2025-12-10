@@ -11,8 +11,12 @@ class GpuDVFSHandler(SimObject):
     sys_clk_domain = Param.SrcClockDomain("System clock domain")
     enable = Param.Bool(False, "Enable/Disable the handler")
 
-    threshold1 = Param.Float(250, "Sensitivity Threshold to tranistion to High Perf")
-    threshold2 = Param.Float(50, "Sensitivity Threshold to tranistion to Medium Perf")
+    dvfs_type = Param.Int(0, "DVFS Choice")
+    highThresh = Param.Float(0.66, "Threshold for Max Performance Transition (default .66)")
+    medThresh = Param.Float(0.33, "Threshold for Max Performance Transition (defalut .33)")
+    decay_factor = Param.Float(0.95, "Decay factor for max sensitivity (default .95)")
+    dvfs_sr = Param.Int(1000000, "Sample period in ps ticks (1000000 = 1us)")
+
     printToScreen = Param.Bool(False, "Print DVFS stats to console")
     
     # The transition latency depends on how much time the PLLs and voltage

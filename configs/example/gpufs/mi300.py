@@ -124,12 +124,23 @@ def runMI300GPUFS(
     parser.add_argument("--enable-gpu-dvfs", action="store_true", default=False, \
         help="Enable the specialized Toy GPU DVFS Handler (Cyclical 3-Level)")
     
-    parser.add_argument("--threshold1", default=250, \
-        help="Upper Sensitivity Threshold to tranistion to High Perf (default: 250)")
-    parser.add_argument("--threshold2", default=50, \
-        help="Middle Sensitivity Threshold to tranistion to Med Perf (default: 50)")
     parser.add_argument("--printToScreen", action="store_true", default=False, \
         help="Print Important DVFS Stats to Console")
+    
+    parser.add_argument("--dvfs_type", default=0, \
+        help="DVFS TYPE")
+
+    parser.add_argument("--dvfs_sr", default=1000000, \
+        help="Sample period in ps ticks (1000000 = 1us)")
+    
+    parser.add_argument("--decay_factor", default=0.95, \
+        help="Decay factor for max sensitivity (default .95)")
+    
+    parser.add_argument("--medThresh", default=0.33, \
+        help="Threshold for Med Performance Transition (defalut .33)")
+    
+    parser.add_argument("--highThresh", default=0.66, \
+        help="Threshold for High Performance Transition (defalut .66)")
 
 
     # Parse now so we can override options

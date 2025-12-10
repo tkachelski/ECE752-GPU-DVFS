@@ -19,9 +19,12 @@ GpuDVFSHandler::GpuDVFSHandler(const Params &p)
       sysClkDomain(p.sys_clk_domain),
       enableHandler(p.enable),
       _transLatency(p.transition_latency),
-      threshold1(p.threshold1),
-      threshold2(p.threshold2),
       printToScreen(p.printToScreen),
+      highThresh(p.highThresh),
+      medThresh(p.medThresh),
+      dvfs_type(p.dvfs_type),
+      dvfs_sr(p.dvfs_sr),
+      decay_factor(p.decay_factor),
       // Cast the generic SimObject pointer from Python to a Shader pointer
       gpuShader(dynamic_cast<Shader*>(p.shader)),
       // Initialize the decisionEvent to call 'runDecisionLoop' when triggered
@@ -167,11 +170,18 @@ int GpuDVFSHandler::dumpImportantStatsToConsole()
             double deltaInstr = instr - prevInstTotal[index];
             double numCycles = cu->stats.totalCycles.total();
             double deltaNumCycles = numCycles - prevNumCycles[index];
+            double frequency = (double)cu->frequency();
+            double voltage = cu->voltage();
+            double deltaIPC = deltaInstr / deltaNumCycles;
+            double performance = frequency * (deltaIPC);
             if(deltaInstr < 0) deltaInstr = instr;
             if(deltaNumCycles < 0) deltaNumCycles = numCycles;
-            double deltaIPC = deltaInstr / deltaNumCycles;
-            double edp = cu->voltage() * cu->voltage() * cu->frequency() * deltaInstr;
-            double ed2p = edp * deltaInstr;
+            double edp = 0;
+            double ed2p = 0;
+            if(performance > 0){
+                edp = voltage * voltage / performance ;
+                ed2p = voltage * voltage / (performance * performance) ;
+            }
             edpTotal += edp; 
             ed2pTotal += ed2p; 
             inform("GPU_DVFS_STATS: CU: %d, perfLevel: %d clock: %d, Cycles: %d, IPC: %f, IPC_delta: %f, CPI: %f, CPI_delta: %f, Frequency: %d, Voltage: %f, EDP: %f, ED2P: %f, EDP_Total: %f, ED2P_Total: %f, Sensitivity: %f"
@@ -266,7 +276,7 @@ void GpuDVFSHandler::runDecisionLoop()
     std::map<Addr, int> pcMap = scanGlobalWavefrontState();
 
     // Poll period: 10us (10,000,000 ticks) when active
-    Tick nextPollTick = 100000;
+    Tick nextPollTick = dvfs_sr;
 
     // Case 1: GPU is IDLE (Map is empty)
     if (pcMap.empty()) {
@@ -304,52 +314,59 @@ void GpuDVFSHandler::runDecisionLoop()
 
     // > 50% Concentration -> STALL -> Low Freq (Level 2)
     // < 50% Concentration -> COMPUTE -> High Freq (Level 0)
-    //if (concentration > 0.66) {
-    //    desiredLevel = 2; // Low Perf
-    //}else if (concentration > 0.33) {
-    //    desiredLevel = 1; // Med Perf
-    //} 
-    //else {
-    //    desiredLevel = 0; // Max Perf
-    //}
+   
    // desiredLevel = 2;
+    static int count1 = 0;
+    static int count2 = 0;
+    static int count3 = 0;
 
-   static int count1 = 0;
-   static int count2 = 0;
-   static int count3 = 0;
+   if(dvfs_type == 0){
 
 
-    if (average/maxSensitivity > .66) {
-        //desiredLevel = 0; // Max Perf
-        count1++;
-        count2 = count2 > 0 ? count2 - 1 : 0;
-        count3 = count3 > 0 ? count3 - 1 : 0;
-    } else if(average/maxSensitivity > .33){
-        count2++;
-        count1 = count1 > 0 ? count1 - 1 : 0;
-        count3 = count3 > 0 ? count3 - 1 : 0;
-        //desiredLevel = 1; // Med Perf
-    }else {
-        count1 = count1 > 0 ? count1 - 1 : 0;
-        count2 = count2 > 0 ? count2 - 1 : 0;
-        count3++;
-        //desiredLevel = 2; // Low Perf
+        if (average/maxSensitivity > highThresh) {
+            count1++;
+            count2 = count2 > 0 ? count2 - 1 : 0;
+            count3 = count3 > 0 ? count3 - 1 : 0;
+        } else if(average/maxSensitivity > medThresh){
+            count2++;
+            count1 = count1 > 0 ? count1 - 1 : 0;
+            count3 = count3 > 0 ? count3 - 1 : 0;
+        }else {
+            count1 = count1 > 0 ? count1 - 1 : 0;
+            count2 = count2 > 0 ? count2 - 1 : 0;
+            count3++;
+        }
+        
+        if(count1 >=2){
+            desiredLevel = 0; // Max Perf
+        }else if(count2 >=2){
+            desiredLevel = 1; // Med Perf
+        }else if(count3 >=2){
+            desiredLevel = 2; // Low Perf
+        }
+        if(desiredLevel != currentLevel){
+            count1 = 0;
+            count2 = 0;
+            count3 = 0;
+        }
+    }else  if(dvfs_type == 1){
+        if (concentration > highThresh) {
+            desiredLevel = 2; // Low Perf
+        }else if (concentration > medThresh) {
+            desiredLevel = 1; // Med Perf
+        } 
+        else {
+            desiredLevel = 0; // Max Perf
+        }
+    }
+    else if(dvfs_type ==2){
+         desiredLevel = 0; // Max Perf
+    }
+    else if(dvfs_type ==3){
+         desiredLevel = 2; // Min Perf
     }
 
-    if(count1 >=2){
-        desiredLevel = 0; // Max Perf
-    }else if(count2 >=2){
-        desiredLevel = 1; // Med Perf
-    }else if(count3 >=2){
-        desiredLevel = 2; // Low Perf
-    }
-    if(desiredLevel != currentLevel){
-        count1 = 0;
-        count2 = 0;
-        count3 = 0;
-    }
-
-    maxSensitivity *= 0.95; // Decay over time
+    maxSensitivity *= decay_factor; // Decay over time
 
     // 4. ACTUATION PHASE
     if (desiredLevel != currentLevel) {
