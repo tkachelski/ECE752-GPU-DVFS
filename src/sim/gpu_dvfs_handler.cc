@@ -84,7 +84,7 @@ double GpuDVFSHandler::computeSensitivity(double deltaInsts, double deltaSchCycl
 {
     if (deltaSchCycles <= 0) return 0.0;
 
-    // 1. Only use Activity (IPC). Removed stall_ratio to prevent inversion bug.
+    // 1. Only use Activity (IPC). 
     double ipc = deltaInsts / deltaSchCycles;
     double activity_score = ipc / TARGET_WAVE_IPC;
     // Clamp to reasonable range [0, 2.0] to prevent outliers
@@ -93,7 +93,7 @@ double GpuDVFSHandler::computeSensitivity(double deltaInsts, double deltaSchCycl
     // // 2. Structural Stalls (Frequency Sensitive)
     // double stall_ratio = deltaSchStalls / deltaSchCycles;
    
-    // 3. Add them up
+    // 3. Add them up- this is upto experiments for the future- which is better?
     // double S = activity_score + stall_ratio;
     double S = activity_score;
     return S; 
