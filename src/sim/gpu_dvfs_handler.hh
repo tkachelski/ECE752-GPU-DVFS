@@ -1,5 +1,5 @@
-#ifndef __SIM_CU_REACTIVE_GPU_DVFS_HANDLER_HH__
-#define __SIM_CU_REACTIVE_GPU_DVFS_HANDLER_HH__
+#ifndef __SIM_GPU_DVFS_HANDLER_HH__
+#define __SIM_GPU_DVFS_HANDLER_HH__
 
 #include "params/GpuDVFSHandler.hh"
 #include "sim/sim_object.hh"
@@ -17,15 +17,10 @@ namespace gem5
 {
 
 /**
- * GpuDVFSHandler (CU-Based Reactive Version)
- * ----------------------------------------------------------------------
- * METRIC STANDARDIZATION:
- * Uses the Sensitivity, Power, and ED2P models
- *
- * STRATEGY:
- * - Measure average Sensitivity (IPC/Target) of the PREVIOUS epoch.
- * - Assume CURRENT epoch will be identical (Reactive).
- * - Optimize for ED2P.
+ * GpuDVFSHandler: PCSTALL-based DVFS for GPUs.
+ * Corrected Implementation:
+ * 1. Sensitivity = Activity Score (IPC based).
+ * 2. Robust PC tracking for prediction.
  */
 class GpuDVFSHandler : public SimObject
 {
@@ -39,28 +34,32 @@ class GpuDVFSHandler : public SimObject
     void startup() override;
 
   private:
-    // ----------------------------------------------------------------------
-    // Metrics & History
-    // ----------------------------------------------------------------------
-    std::map<Wavefront*, Tick> wfCreationTick;
+    // PCSTALL Structures
+    static const int TABLE_SIZE = 128; 
+    double sensitivityTable[TABLE_SIZE]; 
+
+    // Helper to map PC to Table Index (instruction granularity)
+    int getIndex(Addr pc) const { return (pc >> 2) & (TABLE_SIZE - 1); }
+
+    std::map<Wavefront*, Addr> wavefrontLastPC; // Tracks PC from START of epoch
+    std::map<Wavefront*, Tick> wfCreationTick; 
+
+    // History for delta calculation
     std::map<Wavefront*, double> lastWfInstCount;
     std::map<Wavefront*, double> lastWfSchCycles;
     
-    // Per-CU Sensitivity for Stats/Decision
+    // Per-CU Sensitivity for Stats
     std::map<ComputeUnit*, double> currentCuSensitivity; 
 
-    // Mappings
     std::map<ComputeUnit*, DomainID> cuToDomain;
     std::map<ComputeUnit*, int> cuIdMap;
 
-    // ----------------------------------------------------------------------
-    // Standardized Model Constants
-    // ----------------------------------------------------------------------
+    // DVFS Levels: 4GHz (High), 2GHz (Balanced), 1GHz (Low)
     static const int NUM_LEVELS = 3;
-    // 4GHz (High), 2GHz (Balanced), 1GHz (Low)
     double freqsMHz[NUM_LEVELS] = {4000, 2000, 1000};
     double volts[NUM_LEVELS] = {1.0, 0.9, 0.8};
 
+    // Power Model Constants
     const double C_DYNAMIC = 1.0; 
     const double A_ACTIVITY = 1.0; 
 
@@ -86,6 +85,7 @@ class GpuDVFSHandler : public SimObject
     double computePower(double fMHz, double v);
     double computeED2P(double perf, double power);
     
+    void updateSensitivityTable(Addr pc, double s_measured);
     PerfLevel chooseBestLevel(double cuSumS, int cuID);
 
     struct UpdateEvent : public Event
@@ -102,5 +102,4 @@ class GpuDVFSHandler : public SimObject
 
 } // namespace gem5
 
-#endif // __SIM_CU_REACTIVE_GPU_DVFS_HANDLER_HH__
-
+#endif // __SIM_GPU_DVFS_HANDLER_HH__

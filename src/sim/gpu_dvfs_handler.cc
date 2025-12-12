@@ -12,9 +12,14 @@ namespace gem5
 {
 
 // ----------------------------------------------------------------------
-// CONSTANTS FOR TUNING (Matched to PCStall)
+// CONSTANTS FOR TUNING
 // ----------------------------------------------------------------------
+// Target IPC to consider a wave "Compute Bound". 
+// 0.08 is a reasonable target for a healthy vector workload.
 const double TARGET_WAVE_IPC = 0.08; 
+
+// Base Performance for Memory-Bound code (Sensitivity = 0).
+// This prevents "Divide by Zero" in ED2P and represents DRAM throughput.
 const double BASE_PERF_MEM = 0.2; 
 
 GpuDVFSHandler::GpuDVFSHandler(const Params &p)
@@ -22,7 +27,7 @@ GpuDVFSHandler::GpuDVFSHandler(const Params &p)
       sysClkDomain(p.sys_clk_domain),
       enableHandler(p.enable),
       _transLatency(p.transition_latency),
-      pollingInterval(p.polling_interval), // Ensure params match Python
+      pollingInterval(p.polling_interval),
       gpuShader(dynamic_cast<Shader *>(p.shader)),
       decisionEvent([this]{ runDecisionLoop(); }, name())
 {
@@ -40,11 +45,14 @@ GpuDVFSHandler::GpuDVFSHandler(const Params &p)
 void GpuDVFSHandler::startup()
 {
     if (enableHandler) {
+        // Init table to 0.5 (Neutral) instead of 0.0
+        for (int i = 0; i < TABLE_SIZE; i++) sensitivityTable[i] = 0.5;
+
+        wavefrontLastPC.clear();
         wfCreationTick.clear();
         lastWfInstCount.clear();
         lastWfSchCycles.clear();
 
-        // Wait 5ms for OS boot
         schedule(decisionEvent, curTick() + 5000000000); 
     }
 }
@@ -70,21 +78,37 @@ int GpuDVFSHandler::checkIfGPUIsRunning()
 }
 
 // --------------------------------------------------------------------------
-// 1. STANDARDIZED SENSITIVITY & POWER MODELS
+// 1. SENSITIVITY MODEL 
 // --------------------------------------------------------------------------
 double GpuDVFSHandler::computeSensitivity(double deltaInsts, double deltaSchCycles)
 {
     if (deltaSchCycles <= 0) return 0.0;
 
+    // 1. Only use Activity (IPC). Removed stall_ratio to prevent inversion bug.
     double ipc = deltaInsts / deltaSchCycles;
     double activity_score = ipc / TARGET_WAVE_IPC;
-    
-    // Clamp to [0, 2.0]
+    // Clamp to reasonable range [0, 2.0] to prevent outliers
     if (activity_score > 2.0) activity_score = 2.0;
 
-    return activity_score; 
+    // // 2. Structural Stalls (Frequency Sensitive)
+    // double stall_ratio = deltaSchStalls / deltaSchCycles;
+   
+    // 3. Add them up
+    // double S = activity_score + stall_ratio;
+    double S = activity_score;
+    return S; 
 }
 
+void GpuDVFSHandler::updateSensitivityTable(Addr pc, double s_measured)
+{
+    int idx = getIndex(pc);
+    // EMA Update: 75% History, 25% New
+    sensitivityTable[idx] = (sensitivityTable[idx] * 0.75) + (s_measured * 0.25);
+}
+
+// --------------------------------------------------------------------------
+// 2. PERFORMANCE & POWER MODELS
+// --------------------------------------------------------------------------
 double GpuDVFSHandler::predictPerf(double S, double fMHz, double fNomMHz)
 {
     // If S=1, Perf scales linearly with Freq.
@@ -96,7 +120,8 @@ double GpuDVFSHandler::predictPerf(double S, double fMHz, double fNomMHz)
 double GpuDVFSHandler::computePower(double fMHz, double v)
 {
     // Power = C * V^2 * f
-    return C_DYNAMIC * v * v * (fMHz / 1000.0) * A_ACTIVITY; 
+    double dynamic = C_DYNAMIC * v * v * (fMHz / 1000.0) * A_ACTIVITY; 
+    return dynamic;
 }
 
 double GpuDVFSHandler::computeED2P(double perf, double power)
@@ -107,7 +132,7 @@ double GpuDVFSHandler::computeED2P(double perf, double power)
 }
 
 // --------------------------------------------------------------------------
-// 2. DECISION LOGIC
+// 3. DECISION LOGIC
 // --------------------------------------------------------------------------
 GpuDVFSHandler::PerfLevel GpuDVFSHandler::chooseBestLevel(double cuSumS, int cuID)
 {
@@ -118,10 +143,9 @@ GpuDVFSHandler::PerfLevel GpuDVFSHandler::chooseBestLevel(double cuSumS, int cuI
         double f = freqsMHz[lvl];
         double v = volts[lvl];
         
-        // REACTIVE Future Sensitivity == Current Sensitivity
         double perf = predictPerf(cuSumS, f);
         double power = computePower(f, v);
-        double cost = computeED2P(perf, power); 
+        double cost = computeED2P(perf, power); // Using ED2P
         
         if (cost < minCost) {
             minCost = cost;
@@ -129,14 +153,15 @@ GpuDVFSHandler::PerfLevel GpuDVFSHandler::chooseBestLevel(double cuSumS, int cuI
         }
     }
     
-     // DEBUG
-     inform("REACTIVE DECISION CU%d: Measured S=%.4f |-> Pick Level %d ", cuID, cuSumS, bestLevel);
+     // DEBUG: Print the math for CU 0
+    inform("DECISION CU%d: Sensitivty per CU=%.4f |-> Pick Level %d ", 
+       cuID, cuSumS, bestLevel);
 
     return bestLevel;
 }
 
 // --------------------------------------------------------------------------
-// MAIN LOOP (CU LEVEL REACTIVE)
+// MAIN LOOP (FIXED PC TRACKING)
 // --------------------------------------------------------------------------
 void GpuDVFSHandler::runDecisionLoop()
 {
@@ -148,17 +173,19 @@ void GpuDVFSHandler::runDecisionLoop()
     currentCuSensitivity.clear();
 
     for (auto *cu : gpuShader->cuList) {
-        double cuAccumulatedS = 0.0;
+        double cuPredictedSumS = 0.0;
         double activeWaveCount = 0.0;
         
         for (const auto &simd_waves : cu->wfList) {
             for (auto *wf : simd_waves) {
-                // Initialize logic for new wavefronts
+                // Initialize new wavefronts
                 if (wfCreationTick.find(wf) == wfCreationTick.end()) {
                     wfCreationTick[wf] = curTick();
                     lastWfInstCount[wf] = wf->stats.numInstrExecuted.total();
                     lastWfSchCycles[wf] = wf->stats.schCycles.total();
-                    continue; // Skip first partial sample
+                    // Don't have a previous PC yet, so just store current and skip update
+                    wavefrontLastPC[wf] = wf->pc();
+                    continue; 
                 }
 
                 // 1. Measure Deltas
@@ -170,37 +197,46 @@ void GpuDVFSHandler::runDecisionLoop()
                 double deltaSchCycles = currentSchCycles - lastWfSchCycles[wf];
                 lastWfSchCycles[wf] = currentSchCycles;
 
-                // 2. Compute Sensitivity
+                // 2. Compute Sensitivity (Activity Score)
                 double S_measured = computeSensitivity(deltaInsts, deltaSchCycles);
                 
-                // 3. REACTIVE AGGREGATION
-                // If the wave did work or is active, assume it contributes to the CU's
-                // current phase.
+                // 3. Update Table using PREVIOUS PC
+                // verify the WF is active (isRunning) or did work
                 bool isRunning = (wf->getStatus() != Wavefront::S_STOPPED);
                 bool didWork = (deltaInsts > 0);
 
+                if (wavefrontLastPC.count(wf)) {
+                    Addr prevPC = wavefrontLastPC[wf];
+                    //EMA
+                    updateSensitivityTable(prevPC, S_measured);
+                }
+
+                // 4. Predict using CURRENT PC
                 if (isRunning || didWork) {
-                    cuAccumulatedS += S_measured;
-                    activeWaveCount++;
+                    Addr currentPC = wf->pc();
+                    int idx = getIndex(currentPC);
+                    
+                    cuPredictedSumS += sensitivityTable[idx];
+                    //track active waves
+                    activeWaveCount++; 
+                    
+                    // Update state for NEXT epoch
+                    wavefrontLastPC[wf] = currentPC;
                 } else {
-                    // Cleanup stopped waves to save memory
-                    wfCreationTick.erase(wf);
-                    lastWfInstCount.erase(wf);
-                    lastWfSchCycles.erase(wf);
+                    // Wavefront stopped, cleanup
+                    wavefrontLastPC.erase(wf);
                 }
             }
         }
      
-        // Average the sensitivity for this CU
-        double averageS = 0.0;
+        // Sum- Average the sensitivity
         if (activeWaveCount > 0) {
-            averageS = cuAccumulatedS / activeWaveCount;
+            cuPredictedSumS /= activeWaveCount;
         }
-        currentCuSensitivity[cu] = averageS; 
+        currentCuSensitivity[cu] = cuPredictedSumS; 
        
-        // 4. Actuate based on HISTORY (Reactive)
         int cuID = cuIdMap[cu];
-        PerfLevel desiredLevel = chooseBestLevel(averageS, cuID); 
+        PerfLevel desiredLevel = chooseBestLevel(cuPredictedSumS, cuID); 
 
         DomainID did = cuToDomain[cu];
         SrcClockDomain *domain = findDomain(did);
@@ -247,14 +283,13 @@ int GpuDVFSHandler::dumpImportantStatsToConsole()
         if(deltaNumCycles <= 0) deltaNumCycles = 1;
         
         double deltaIPC = deltaInstr / deltaNumCycles;
-        double currentActivityScore = deltaIPC / TARGET_WAVE_IPC; 
+        double currentActivityScore = deltaIPC / TARGET_WAVE_IPC; // ACTUAL Score
 
         double v = cu->voltage();
         double fHz = cu->frequency();
         double fMHz = fHz / 1e6;
 
-        // In Reactive mode, S
-        double S = currentCuSensitivity[cu]; 
+        double S = currentCuSensitivity[cu]; // PREDICTED Score
 
         double perf = predictPerf(S, fMHz); 
         double power = computePower(fMHz, v);
@@ -287,5 +322,7 @@ int GpuDVFSHandler::dumpImportantStatsToConsole()
     return 0;
 }
 
-} // namespace gem5
 
+
+
+} // namespace gem5
