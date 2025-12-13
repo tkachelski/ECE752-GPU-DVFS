@@ -65,17 +65,10 @@ GpuDVFSHandler::findDomain(DomainID domain_id) const
     if (it == domains.end()) return nullptr;
     return it->second;
 }
-
-// ----------------------------------------------------------------------
-// GLOBAL WAVEFRONT SCANNER (Data Collection Phase)
-// ----------------------------------------------------------------------
-std::map<Addr, int> GpuDVFSHandler::scanGlobalWavefrontState()
-{
-    std::map<Addr, int> pcHistogram;
-
+int GpuDVFSHandler::countWFActive(){
+    int count = 0;
     if (!gpuShader) {
-        inform("GPU_DVFS ERROR: gpuShader pointer is NULL!");
-        return pcHistogram;
+        return 0;
     }
 
     int totalWavesSeen = 0;
@@ -89,13 +82,45 @@ std::map<Addr, int> GpuDVFSHandler::scanGlobalWavefrontState()
                 totalWavesSeen++; 
                 if (wave->getStatus() != Wavefront::S_STOPPED) {
                     // Add to histogram: This counts how many waves are at this specific PC
-                    pcHistogram[wave->pc()]++;
+                    count++;
                 }
             }
         }
     }
 
-    return pcHistogram;
+    return count;
+}
+// ----------------------------------------------------------------------
+// GLOBAL WAVEFRONT SCANNER (Data Collection Phase)
+// ----------------------------------------------------------------------
+int GpuDVFSHandler::scanGlobalWavefrontState()
+{
+    int count = 0;
+    if (!gpuShader) {
+        inform("GPU_DVFS ERROR: gpuShader pointer is NULL!");
+        return 0;
+    }
+
+    int totalWavesSeen = 0;
+
+    // Iterate over ALL Compute Units
+    for (auto *cu : gpuShader->cuList) {
+        // Iterate over ALL SIMDs
+        for (const auto &simd_waves : cu->wfList) {
+            // Iterate over ALL Wavefronts
+            for (auto *wave : simd_waves) {
+                totalWavesSeen++; 
+                if (wave->getStatus() != Wavefront::S_STOPPED) {
+                    // Add to histogram: This counts how many waves are at this specific PC
+                    if(wave->pendingFetch){
+                        count++;
+                    }
+                }
+            }
+        }
+    }
+
+    return count;
 }
 
 // ----------------------------------------------------------------------
@@ -128,23 +153,36 @@ int GpuDVFSHandler::checkIfGPUIsRunning()
 
 int GpuDVFSHandler::computeUnitSensitivity()
 {
-    static double prevInstrExecuted[40] = {0};
+    static double prevStalledCycles[40][40];
+    static double prevTotalCycles[40][40];
+    double currentTotalCycles = 0;
+    double currentStalledCycles = 0;
     // Iterate over ALL Compute Units
-    int index = 0;
+    int cu_index = 0;
+    int wf_index = 0;
     for (auto *cu : gpuShader->cuList) {
-        // Iterate over ALL SIMDs
-        double ipc = cu->stats.ipc.total();
-        if(!std::isnan(ipc) && ipc > 0){
-            double instr = cu->stats.numInstrExecuted.total();
-            double deltaInstr = instr - prevInstrExecuted[index];
-            if(deltaInstr < 0) deltaInstr = instr;
-            sensitivity[index] = deltaInstr / (cu->frequency()/1000000000);
-            //sensitivity[index] = cu->frequency() / newInstr;
-            
-            //inform("GPU_DVFS: CU %d inst: %d, recent: %d, freq: %d, sensitivity is %f", index, instr, newInstr, cu->frequency(), sensitivity[index]);
-            prevInstrExecuted[index] = instr;
-        }
-        index++;
+        double sum = 0.0;
+        for (const auto &simd_waves : cu->wfList) {
+            for (auto *wave : simd_waves) {
+                if (wave->getStatus() != Wavefront::S_STOPPED) {
+                    currentTotalCycles =  wave->stats.schCycles.total();
+                    currentStalledCycles = wave->stats.schStalls.total();
+                    double deltaTotal = currentTotalCycles - prevTotalCycles[cu_index][wf_index];
+                    double deltaStalled = currentStalledCycles - prevStalledCycles[cu_index][wf_index];
+                    if(deltaStalled < 0) deltaStalled = currentStalledCycles;
+                    if(deltaTotal > 0) 
+                        sum += deltaStalled / deltaTotal;
+                    wf_index++;
+                }
+                //inform("GPU_DVFS_DEBUG: CU %d, WF %d, Total Cycles: %f, Stalled Cycles: %f", cu_index, wf_index, wave->stats.schCycles.total(), wave->stats.schStalls.total());
+            }
+        }            
+        sensitivity[cu_index] = sum / wf_index;
+        //inform("GPU_DVFS: CU %d inst: %d, recent: %d, freq: %d, sensitivity is %f", index, instr, newInstr, cu->frequency(), sensitivity[index]);
+        prevStalledCycles[cu_index][wf_index] = currentStalledCycles;
+        prevTotalCycles[cu_index][wf_index] = currentTotalCycles;
+        cu_index++;
+        wf_index = 0;
     }
     return 0;
 }
@@ -154,9 +192,11 @@ int GpuDVFSHandler::dumpImportantStatsToConsole()
 {
     static double prevInstTotal[40] = {0};
     static double prevNumCycles[40] = {0};
+    //static double prevIdleCycles[40] = {0};
     static double initTime = 0;
     static double edpTotal = 0.0;
     static double ed2pTotal = 0.0;
+    static double energy = 0.0;
     // Iterate over ALL Compute Units
     int index = 0;
     for (auto *cu : gpuShader->cuList) {
@@ -169,22 +209,30 @@ int GpuDVFSHandler::dumpImportantStatsToConsole()
             double instr = cu->stats.numInstrExecuted.total();
             double deltaInstr = instr - prevInstTotal[index];
             double numCycles = cu->stats.totalCycles.total();
+            //double idleCycles = wf->stats.schStalls.total();
             double deltaNumCycles = numCycles - prevNumCycles[index];
+            //double deltaIdleCycles = idleCycles - prevIdleCycles[index];
             double frequency = (double)cu->frequency();
             double voltage = cu->voltage();
-            double deltaIPC = deltaInstr / deltaNumCycles;
+            double deltaIPC = 0;
             double performance = frequency * (deltaIPC);
             if(deltaInstr < 0) deltaInstr = instr;
             if(deltaNumCycles < 0) deltaNumCycles = numCycles;
+            if(deltaNumCycles > 0)
+                deltaIPC = deltaInstr / deltaNumCycles;
+            //if(deltaIdleCycles < 0) deltaIdleCycles = idleCycles;
             double edp = 0;
             double ed2p = 0;
             if(performance > 0){
                 edp = voltage * voltage / performance ;
                 ed2p = voltage * voltage / (performance * performance) ;
             }
+            double A = deltaIPC;
+            double power = A * voltage * voltage * frequency;
+            energy += power;
             edpTotal += edp; 
             ed2pTotal += ed2p; 
-            inform("GPU_DVFS_STATS: CU: %d, perfLevel: %d clock: %d, Cycles: %d, IPC: %f, IPC_delta: %f, CPI: %f, CPI_delta: %f, Frequency: %d, Voltage: %f, EDP: %f, ED2P: %f, EDP_Total: %f, ED2P_Total: %f, Sensitivity: %f"
+            inform("GPU_DVFS_STATS: CU: %d, perfLevel: %d clock: %d, Cycles: %d, IPC: %f, IPC_delta: %f, CPI: %f, CPI_delta: %f, Frequency: %d, Voltage: %f, EDP: %f, ED2P: %f, EDP_Total: %f, ED2P_Total: %f,Power: %f, Energy: %f, Sensitivity: %f"
                , index
                , domains.begin()->second->perfLevel()
                , curTick() - initTime
@@ -199,10 +247,13 @@ int GpuDVFSHandler::dumpImportantStatsToConsole()
                , ed2p
                , edpTotal
                , ed2pTotal
+               , power
+               , energy
                , sensitivity[index]
             );
             prevInstTotal[index] = instr;
             prevNumCycles[index] = numCycles;
+            //prevIdleCycles[index] = idleCycles;
         }
         index++;
     }
@@ -229,7 +280,7 @@ void GpuDVFSHandler::runDecisionLoop()
 {
     static bool hasPrintedRunning = false;
     static int idleHeartbeat = 0;
-    static double maxSensitivity = 0.0;
+    //static double maxSensitivity = 0.0;
 
     int isRunning = checkIfGPUIsRunning();
 
@@ -259,10 +310,10 @@ void GpuDVFSHandler::runDecisionLoop()
         return;
     }
     computeUnitSensitivity();
-    double average = sensitivityAverage();
-    if(average > maxSensitivity){
-        maxSensitivity = average;
-    }
+    double average = 1 - sensitivityAverage();
+    //if(average > maxSensitivity){
+    //    maxSensitivity = average;
+    //}
     inform("GPU_DVFS: Average CU Sensitivity: %f", average);
     if(printToScreen)
         dumpImportantStatsToConsole();
@@ -273,41 +324,33 @@ void GpuDVFSHandler::runDecisionLoop()
     DomainID targetDomain = it->first; 
 
     // 1. GATHER PHASE
-    std::map<Addr, int> pcMap = scanGlobalWavefrontState();
+    int stalled =scanGlobalWavefrontState ();
+    int totalWave = countWFActive();
 
     // Poll period: 10us (10,000,000 ticks) when active
     Tick nextPollTick = dvfs_sr;
 
     // Case 1: GPU is IDLE (Map is empty)
-    if (pcMap.empty()) {
-        // GPU became idle mid-execution
-        schedule(decisionEvent, curTick() + nextPollTick);
-        return;
-    }
-
+    
 
     // 2. ANALYZE PHASE: Calculate PC Concentration
     int maxWavesAtOnePC = 0;
     int totalActiveWaves = 0;
     Addr dominantPC = 0;
 
-    for (auto const& [pc, count] : pcMap) {
-        totalActiveWaves += count;
-        if (count > maxWavesAtOnePC) {
-            maxWavesAtOnePC = count;
-            dominantPC = pc;
-        }
-    }
 
     // "Concentration" metric: 0.0 to 1.0
     // High Concentration implies waves are synchronized at a bottleneck (Stall).
     // Low Concentration implies waves are executing freely (Compute).
     double concentration = 0.0;
-    static double prevConcentration = 0;;
-    if (totalActiveWaves > 0) {
-        concentration = (double)maxWavesAtOnePC / totalActiveWaves;
-    }
+    static double prevConcentration = 0;
+    if (totalWave > 0) {
+        concentration = (double)stalled / totalWave;
+    }else{
+        concentration = prevConcentration;
 
+    }
+    prevConcentration = concentration;
     // 3. DECISION PHASE
     PerfLevel currentLevel = domain->perfLevel();
     PerfLevel desiredLevel = currentLevel;
@@ -323,11 +366,11 @@ void GpuDVFSHandler::runDecisionLoop()
    if(dvfs_type == 0){
 
 
-        if (average/maxSensitivity > highThresh) {
+        if (average > highThresh) {
             count1++;
             count2 = count2 > 0 ? count2 - 1 : 0;
             count3 = count3 > 0 ? count3 - 1 : 0;
-        } else if(average/maxSensitivity > medThresh){
+        } else if(average > medThresh){
             count2++;
             count1 = count1 > 0 ? count1 - 1 : 0;
             count3 = count3 > 0 ? count3 - 1 : 0;
@@ -366,7 +409,7 @@ void GpuDVFSHandler::runDecisionLoop()
          desiredLevel = 2; // Min Perf
     }
 
-    maxSensitivity *= decay_factor; // Decay over time
+    //maxSensitivity *= decay_factor; // Decay over time
 
     // 4. ACTUATION PHASE
     if (desiredLevel != currentLevel) {

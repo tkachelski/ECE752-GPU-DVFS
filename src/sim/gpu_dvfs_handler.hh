@@ -88,7 +88,8 @@ class GpuDVFSHandler : public SimObject
      * Returns a Histogram: <PC Address, Count of Wavefronts at this PC>
      * This provides the "Signature" of the workload at this exact tick.
      */
-    std::map<Addr, int> scanGlobalWavefrontState(); 
+    int scanGlobalWavefrontState();
+    int countWFActive();
 
     int checkIfGPUIsRunning();
     int computeUnitSensitivity();
